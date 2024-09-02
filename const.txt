@@ -1,0 +1,102 @@
+const puppeteer = require('puppeteer');
+const mysql = require('mysql2/promise');
+const { Cluster } = require('puppeteer-cluster');
+
+const dbConfig = {
+  host: 'localhost',
+  user: 'root',
+  password: '050504',
+  database: 'crawl',
+};
+
+let cluster;
+const insertDomain = async (connection, categoryName, domain) => {
+  await connection.execute(
+    'INSERT INTO crawling (categories, domains) VALUES (?, ?)',
+    [categoryName, domain]
+  );
+  await connection.execute(
+    'INSERT INTO categories_domain (done) VALUES (1)',
+    
+  );
+  console.log(`Inserted domain '${domain}' for category '${categoryName}'`);
+};
+
+(async () => {
+  try {
+    const connection = await mysql.createConnection(dbConfig);
+
+    cluster = await Cluster.launch({
+      concurrency: Cluster.CONCURRENCY_CONTEXT,
+      monitor: true,
+      maxConcurrency: 2,
+      puppeteerOptions: {
+        headless: false,
+      },
+    });
+
+    await cluster.task(async ({ page, data }) => {
+      const { categoryName, url } = data;
+
+      const scrapeDomains = async (pageUrl) => {
+        await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 50000 });
+        await page.setUserAgent(
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        );
+
+        await page.waitForSelector('div.pages-wrapper');
+
+        return await page.evaluate(() => {
+          const domainList = [];
+          const elements = document.querySelectorAll('div.pages-wrapper h3');
+          elements.forEach(element => {
+            domainList.push(element.textContent.trim());
+          });
+          return domainList;
+        });
+      };
+
+      // Scrape the first page
+      const domainsFirstPage = await scrapeDomains(url);
+      for (const domain of domainsFirstPage) {
+        await insertDomain(connection, categoryName, domain);
+      }
+
+      const pages = [2, 3, 4];
+      for (const pageNum of pages) {
+        const pageUrl = `https://front-page.com/gallery?pageno=${pageNum}&search=${categoryName}&country=IN&lang=en`;
+        const domains = await scrapeDomains(pageUrl);
+        for (const domain of domains) {
+          await insertDomain(connection, categoryName, domain);
+        }
+      }
+    });
+
+    const [categories] = await connection.execute(
+      'SELECT categories FROM categories_domain WHERE done IS NULL'
+    );
+
+    for (const row of categories) {
+      const categoryName = row.categories;
+      if (categoryName) {
+        const url = `https://front-page.com/gallery?search=${categoryName}`;
+        cluster.queue({ categoryName, url });
+      } else {
+        console.warn('Category name is missing');
+      }
+    }
+
+    await cluster.idle();
+
+  } catch (error) {
+    console.error('Error occurred:', error);
+  } finally {
+    if (cluster) {
+      try {
+        await cluster.close();
+      } catch (error) {
+        console.error('Error closing cluster:', error);
+      }
+    }
+  }
+})();
