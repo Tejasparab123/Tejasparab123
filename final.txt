@@ -1,0 +1,124 @@
+const puppeteer = require("puppeteer");
+const mysql = require("mysql2/promise");
+const { Cluster } = require("puppeteer-cluster");
+
+const dbConfig = {
+    host: "localhost",
+    user: "root",
+    password: "050504",
+    database: "crawl",
+};
+
+// Function to create a new database connection
+const createDbConnection = async () => {
+    return mysql.createConnection(dbConfig);
+};
+
+// Function to process each page
+const processPage = async (page, data, connection) => {
+    const { categoryName, baseUrl } = data;
+    const pagesToScrape = [1, 2, 3,4]; // Define which pages to scrape
+
+    for (const pageNum of pagesToScrape) {
+        try {
+            const pageUrl = pageNum === 1
+                ? `${baseUrl}?search=${categoryName}`
+                : `${baseUrl}?pageno=${pageNum}&search=${categoryName}&country=IN&lang=en`;
+
+            await page.goto(pageUrl, { waitUntil: "networkidle2", timeout: 50000 });
+            await page.setUserAgent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            );
+
+            await page.waitForSelector("div.pages-wrapper");
+
+            const domains = await page.evaluate(() => {
+                const domainList = [];
+                const elements = document.querySelectorAll("div.pages-wrapper h3");
+                elements.forEach((element) => {
+                    domainList.push(element.textContent.trim());
+                });
+                return domainList;
+            });
+
+            // Insert each domain into the database with its category name
+            const promises = domains.map(domain =>
+                connection.execute(
+                    "INSERT INTO crawling (categories, domains) VALUES (?, ?)",
+                    [categoryName, domain]
+                )
+            );
+            await Promise.all(promises);
+
+            // Update the database to mark the category as done
+            await connection.execute(
+                `UPDATE categories_domain SET done = 1 WHERE categories = ?`,
+                [categoryName]
+            );
+
+        } catch (error) {
+            console.error(`Error processing page ${pageNum} for category ${categoryName}:`, error);
+        }
+    }
+};
+
+// Main function
+(async () => {
+
+    let connection;
+    let cluster;
+    try {
+        connection = await createDbConnection();
+
+        cluster = await Cluster.launch({
+            concurrency: Cluster.CONCURRENCY_PAGE,
+            monitor: true,
+            maxConcurrency: 2,
+            puppeteerOptions: {
+                headless: false,
+                executablePath: "C:/program files/BraveSoftware/Brave-Browser/Application/brave.exe",
+            },
+        });
+
+        await cluster.task(async ({ page, data }) => {
+            await processPage(page, data, connection);
+        });
+
+        // Fetch categories from the database
+        const [categories] = await connection.execute(
+            "SELECT categories FROM categories_domain WHERE done IS NULL"
+        );
+
+        // Queue each category for processing
+        for (const row of categories) {
+            const categoryName = row.categories;
+            if (categoryName) {
+                const baseUrl = "https://front-page.com/gallery";
+                cluster.queue({ categoryName, baseUrl });
+            } else {
+                console.warn("Category name is missing");
+            }
+        }
+
+        // Wait for all tasks to complete
+        await cluster.idle();
+
+    } catch (error) {
+        console.error("Error occurred:", error);
+    } finally {
+        if (cluster) {
+            try {
+                await cluster.close();
+            } catch (error) {
+                console.error("Error closing cluster:", error);
+            }
+        }
+        if (connection) {
+            try {
+                await connection.end();
+            } catch (error) {
+                console.error("Error closing database connection:", error);
+            }
+        }
+    }
+})();
